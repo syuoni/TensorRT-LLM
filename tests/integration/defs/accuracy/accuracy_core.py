@@ -15,13 +15,17 @@
 import json
 import math
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import pytest
 import scipy
 import yaml
 
+import tensorrt_llm.evaluate
+from tensorrt_llm._torch import LLM as PyTorchLLM
 from tensorrt_llm.builder import BuildConfig
+from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -55,8 +59,7 @@ class AccuracyTask:
 
     # Dataset
     DATASET = None
-    DATASET_DIR = f"{llm_models_root()}/datasets"
-    ROUGE_DIR = f"{llm_models_root()}/rouge"
+    DATASET_DIR = None
     HIGHER_IS_BETTER = True
 
     # Hypothesis testing parameters
@@ -125,9 +128,30 @@ class AccuracyTask:
               "===========================================================\n")
         return num_samples, threshold
 
+    def create_evaluator(self, **kwargs):
+        raise NotImplementedError()
+
+    def evaluate(self, llm: Union[LLM, PyTorchLLM]):
+        num_samples, threshold = self.get_num_samples_and_threshold(
+            dtype=llm.args.dtype,
+            quant_algo=llm.args.quant_config.quant_algo,
+            kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo)
+
+        sampling_params = SamplingParams(
+            max_tokens=self.MAX_OUTPUT_LEN,
+            truncate_prompt_tokens=self.MAX_INPUT_LEN)
+        evaluator = self.create_evaluator(num_samples=num_samples)
+        accuracy = evaluator.evaluate(llm, sampling_params)
+        if self.HIGHER_IS_BETTER:
+            assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}"
+        else:
+            assert accuracy <= threshold, f"Expected accuracy <= {threshold}, but got {accuracy}"
+
 
 class CnnDailymail(AccuracyTask):
     DATASET = "cnn_dailymail"
+    DATASET_DIR = f"{llm_models_root()}/datasets/ccdv/cnn_dailymail"
+    ROUGE_DIR = f"{llm_models_root()}/rouge"
 
     ALPHA = 0.002
     BETA = 0.2
@@ -138,9 +162,17 @@ class CnnDailymail(AccuracyTask):
     MAX_INPUT_LEN = 924
     MAX_OUTPUT_LEN = 100
 
+    def create_evaluator(self, **kwargs):
+        return tensorrt_llm.evaluate.CnnDailymail(dataset_path=self.DATASET_DIR,
+                                                  random_seed=0,
+                                                  rouge_path=self.ROUGE_DIR,
+                                                  **kwargs)
+
 
 class Humaneval(AccuracyTask):
     DATASET = "humaneval"
+    DATASET_DIR = f"{llm_models_root()}/datasets/openai_humaneval"
+    ROUGE_DIR = f"{llm_models_root()}/rouge"
 
     ALPHA = 0.002
     BETA = 0.2
@@ -154,6 +186,8 @@ class Humaneval(AccuracyTask):
 
 class ZeroScrolls(AccuracyTask):
     DATASET = "zero_scrolls"
+    DATASET_DIR = f"{llm_models_root()}/datasets/tau/zero_scrolls"
+    ROUGE_DIR = f"{llm_models_root()}/rouge"
 
     ALPHA = 0.002
     BETA = 0.2
@@ -167,7 +201,9 @@ class ZeroScrolls(AccuracyTask):
 
 class SlimPajama6B(AccuracyTask):
     DATASET = "SlimPajama-6B"
+    DATASET_DIR = f"{llm_models_root()}/datasets/SlimPajama-6B"
     HIGHER_IS_BETTER = False
+    ROUGE_DIR = f"{llm_models_root()}/rouge"
 
     ALPHA = 0.002
     BETA = 0.2
@@ -192,6 +228,11 @@ class Mmlu(AccuracyTask):
     MAX_BATCH_SIZE = 128
     MAX_INPUT_LEN = 4094
     MAX_OUTPUT_LEN = 2
+
+    def create_evaluator(self, **kwargs):
+        return tensorrt_llm.evaluate.Mmlu(dataset_path=self.DATASET_DIR,
+                                          random_seed=0,
+                                          **kwargs)
 
 
 class PassKeyRetrieval64k(AccuracyTask):
@@ -587,3 +628,13 @@ class AccuracyTestHarness:
         self.convert()
         self.build()
         self.evaluate()
+
+
+class LlmapiAccuracyTestHarness:
+    # Model
+    MODEL_NAME = None
+    MODEL_PATH = None
+
+    @classmethod
+    def setup_class(cls):
+        logger.set_level("info")

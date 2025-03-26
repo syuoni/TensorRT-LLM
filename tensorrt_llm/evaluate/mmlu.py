@@ -14,7 +14,7 @@
 # limitations under the License.
 import math
 import random
-from typing import List, Union
+from typing import Iterable, List, Union
 
 import click
 import numpy as np
@@ -149,7 +149,7 @@ class Mmlu(Evaluator):
             prompt += self.format_example(train_df, i)
         return prompt
 
-    def generate_samples(self):
+    def generate_samples(self) -> Iterable[tuple]:
         for subject in self.SUBJECT_TO_SUBCATEGORIES.keys():
             dev_df = pd.read_csv(f"{self.dataset_path}/dev/{subject}_dev.csv",
                                  header=None)
@@ -170,7 +170,7 @@ class Mmlu(Evaluator):
                 yield prompt, label, subject
 
     def compute_score(self, outputs: List[RequestOutput], references: List[str],
-                      subjects: List[str]):
+                      subjects: List[str]) -> float:
         subject_corrections = {
             key: []
             for key in self.SUBJECT_TO_SUBCATEGORIES.keys()
@@ -231,7 +231,7 @@ class Mmlu(Evaluator):
     @staticmethod
     def command(ctx, dataset_path: str, num_samples: int, num_train: int,
                 random_seed: int, max_input_length: int, max_output_length: int,
-                check_accuracy: bool, accuracy_threshold: float):
+                check_accuracy: bool, accuracy_threshold: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -244,4 +244,4 @@ class Mmlu(Evaluator):
         llm.shutdown()
 
         if check_accuracy:
-            assert accuracy > accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"
+            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"

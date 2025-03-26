@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List, Union
+from typing import Iterable, List, Union
 
 import click
 import datasets
@@ -40,7 +40,7 @@ class CnnDailymail(Evaluator):
             self.num_samples = min(num_samples, self.data.num_rows)
         self.rouge = evaluate.load(rouge_path)
 
-    def generate_samples(self):
+    def generate_samples(self) -> Iterable[tuple]:
         for i, sample in enumerate(self.data):
             if i >= self.num_samples:
                 break
@@ -50,13 +50,13 @@ class CnnDailymail(Evaluator):
             yield prompt, reference
 
     def compute_score(self, outputs: List[RequestOutput],
-                      references: List[str]):
+                      references: List[str]) -> float:
         metrics = self.rouge.compute(
             predictions=[output.outputs[0].text for output in outputs],
             references=references)
         for key in metrics.keys():
             logger.info(f"  {key}: {metrics[key]*100:.3f}")
-        return metrics["rouge1"]
+        return metrics["rouge1"] * 100
 
     @click.command("cnn_dailymail")
     @click.option("--dataset_path", type=str, default="ccdv/cnn_dailymail")
@@ -71,7 +71,7 @@ class CnnDailymail(Evaluator):
     @staticmethod
     def command(ctx, dataset_path: str, num_samples: int, random_seed: int,
                 rouge_path: str, max_input_length: int, max_output_length: int,
-                check_accuracy: bool, accuracy_threshold: float):
+                check_accuracy: bool, accuracy_threshold: float) -> None:
         llm: Union[LLM, PyTorchLLM] = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
@@ -84,4 +84,4 @@ class CnnDailymail(Evaluator):
         llm.shutdown()
 
         if check_accuracy:
-            assert accuracy > accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"
+            assert accuracy >= accuracy_threshold, f"Expected accuracy >= {accuracy_threshold}, but got {accuracy}"

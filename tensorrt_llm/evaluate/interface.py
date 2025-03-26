@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod, abstractstaticmethod
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Union
 
 from tqdm import tqdm
 
@@ -28,17 +28,17 @@ from ..sampling_params import SamplingParams
 class Evaluator(ABC):
 
     @abstractmethod
-    def generate_samples(self):
+    def generate_samples(self) -> Iterable[tuple]:
         raise NotImplementedError()
 
     @abstractmethod
     def compute_score(self, outputs: List[RequestOutput], references: List[str],
-                      *auxiliaries):
+                      *auxiliaries) -> float:
         raise NotImplementedError()
 
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
-                 sampling_params: Optional[SamplingParams] = None):
+                 sampling_params: Optional[SamplingParams] = None) -> float:
         profiler.start("trtllm exec")
         outputs, references, auxiliaries = [], [], []
         for prompt, reference, *aux in tqdm(self.generate_samples(),
@@ -57,5 +57,5 @@ class Evaluator(ABC):
         return score
 
     @abstractstaticmethod
-    def command(ctx, *args, **kwargs):
+    def command(ctx, *args, **kwargs) -> None:
         raise NotImplementedError()
