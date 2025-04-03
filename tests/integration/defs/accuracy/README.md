@@ -25,44 +25,29 @@ Since we care about accuracy regression only, so it should be a one-tailed hypot
 According to the two-sample t-test method, we can compute the t-statistic $t = \frac{\bar{x'} - \bar{x}}{\sqrt{2 \sigma^2 / n}}$. According to the Central Limit Theorem (CLT), the t-statistic is from a distribution that converges to the standard normal distribution $\mathcal{N} (0, 1)$.
 
 Given the threshold $\gamma$, the false positive (type I error) rate $\alpha$ can be formulated as:
+
 $$
-\begin{equation*}
-\begin{aligned}
-\alpha &= P \left(\bar{x'} \leq \gamma \mid t \sim \mathcal{N} (0, 1) \right) \\
-&= P \left(t \leq \frac{\gamma - \bar{x}}{\sqrt{2 \sigma^2 / n}} \mid t \sim \mathcal{N} (0, 1) \right).
-\end{aligned}
-\end{equation*}
+\alpha = P \left(\bar{x'} \leq \gamma \mid t \sim \mathcal{N} (0, 1) \right) = P \left(t \leq \frac{\gamma - \bar{x}}{\sqrt{2 \sigma^2 / n}} \mid t \sim \mathcal{N} (0, 1) \right)
 $$
 
-In practive, we setup a $\alpha$ (e.g., 0.05) and then compute the threshold $\gamma$:
+In practice, we setup a $\alpha$ (e.g., 0.05) and then compute the threshold $\gamma$:
+
 $$
-\begin{equation*}
-\gamma = \Phi^{-1} (\alpha) \cdot \sqrt{2 \sigma^2 / n} + \bar{x}.
-\end{equation*}
+\gamma = \Phi^{-1} (\alpha) \cdot \sqrt{2 \sigma^2 / n} + \bar{x}
 $$
 
 Note that $\alpha$ is typically smaller than 0.5, so $\gamma < \bar{x}$.
 
 Given the minimum detectable effect $\theta$, the false negative (type II error) rate $\beta$ can be formulated as:
+
 $$
-\begin{equation*}
-\begin{aligned}
-\beta &= P \left(\bar{x'} > \gamma \mid t \sim \mathcal{N} (-\frac{\theta}{\sqrt{2 \sigma^2 / n}}, 1) \right) \\
-&= P \left(t > \frac{\gamma - \bar{x}}{\sqrt{2 \sigma^2 / n}} \mid t \sim \mathcal{N} (-\frac{\theta}{\sqrt{2 \sigma^2 / n}}, 1) \right) \\
-&= P \left(t + \frac{\theta}{\sqrt{2 \sigma^2 / n}} > \frac{\gamma - \bar{x} + \theta}{\sqrt{2 \sigma^2 / n}} \mid t + \frac{\theta}{\sqrt{2 \sigma^2 / n}} \sim \mathcal{N} (0, 1) \right) \\
-&= P \left(t + \frac{\theta}{\sqrt{2 \sigma^2 / n}} > \Phi^{-1} (\alpha) + \frac{\theta}{\sqrt{2 \sigma^2 / n}} \mid t + \frac{\theta}{\sqrt{2 \sigma^2 / n}} \sim \mathcal{N} (0, 1) \right)
-\end{aligned}
-\end{equation*}
+\beta = P \left(\bar{x'} > \gamma \mid t \sim \mathcal{N} (-\frac{\theta}{\sqrt{2 \sigma^2 / n}}, 1) \right) = P \left(t > \frac{\gamma - \bar{x}}{\sqrt{2 \sigma^2 / n}} \mid t \sim \mathcal{N} (-\frac{\theta}{\sqrt{2 \sigma^2 / n}}, 1) \right) = P \left(t + \frac{\theta}{\sqrt{2 \sigma^2 / n}} > \frac{\gamma - \bar{x} + \theta}{\sqrt{2 \sigma^2 / n}} \mid t + \frac{\theta}{\sqrt{2 \sigma^2 / n}} \sim \mathcal{N} (0, 1) \right) = P \left(t + \frac{\theta}{\sqrt{2 \sigma^2 / n}} > \Phi^{-1} (\alpha) + \frac{\theta}{\sqrt{2 \sigma^2 / n}} \mid t + \frac{\theta}{\sqrt{2 \sigma^2 / n}} \sim \mathcal{N} (0, 1) \right)
 $$
 
 In practice, we setup a $\beta$ (e.g., 0.2) and then compute $\theta$:
+
 $$
-\begin{equation*}
-\begin{aligned}
-\theta &= (\Phi^{-1} (1-\beta) - \Phi^{-1} (\alpha)) \cdot \sqrt{2 \sigma^2 / n} \\
-&= - (\Phi^{-1} (\alpha) + \Phi^{-1} (\beta)) \cdot \sqrt{2 \sigma^2 / n}
-\end{aligned}
-\end{equation*}
+\theta = - (\Phi^{-1} (\alpha) + \Phi^{-1} (\beta)) \cdot \sqrt{2 \sigma^2 / n}
 $$
 
 Note that $\alpha$ and $\beta$ are typical smaller than 0.5, so $\theta > 0$.
