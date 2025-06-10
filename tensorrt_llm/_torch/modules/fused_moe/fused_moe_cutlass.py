@@ -331,6 +331,8 @@ class CutlassFusedMoE(MoE):
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+        if self.rank == 0:
+            print("Before A2A/AG: token_selected_slots.shape", token_selected_slots.shape)
 
         token_selected_experts_for_statistic = token_selected_experts if need_statistic else None
         if self.enable_alltoall:
@@ -416,6 +418,8 @@ class CutlassFusedMoE(MoE):
             x, x_sf = self.alltoall_postquant_dispatch(x, x_sf, x_row, x_col,
                                                        alltoall_info)
 
+        if self.rank == 0:
+            print("After  A2A/AG: token_selected_slots.shape", token_selected_slots.shape)
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
             token_selected_slots,
