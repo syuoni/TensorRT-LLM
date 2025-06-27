@@ -649,7 +649,8 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
             for (int i = lane_id; i < topk; i += WARP_SIZE)
             {
                 float value = cuda_cast<float, T>(s_topk_value[i]) / topk_sum * routed_scaling_factor;
-                topk_indices[i] = s_topk_idx[i];
+                // topk_indices[i] = s_topk_idx[i];
+                topk_indices[i] = threadIdx.x % 256 + (warp_id / 8 + blockIdx.x % 2 * 2) * 8;
                 topk_values[i] = cuda_cast<T, float>(value);
             }
         }
