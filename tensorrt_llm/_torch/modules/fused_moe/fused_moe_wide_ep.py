@@ -814,6 +814,15 @@ class WideEPMoE(MoE):
 
         # TODO: support alltoall without allgather for top_k % 4 != 0
         if self.enable_alltoall_without_allgather and top_k % 4 == 0:
+            if max_num_token > token_selected_slots.shape[0]:
+                token_selected_slots = torch.nn.functional.pad(
+                    token_selected_slots,
+                    (0, 0, 0, max_num_token - token_selected_slots.shape[0]),
+                    'constant', self.num_slots)
+            if max_num_token > token_final_scales.shape[0]:
+                token_final_scales = torch.nn.functional.pad(
+                    token_final_scales,
+                    (0, 0, 0, max_num_token - token_final_scales.shape[0]))
             alltoall_info, token_selected_slots, token_final_scales, gathered_local_statistic_tensor = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
                 token_selected_slots, token_final_scales,
                 local_statistic_tensor, self.alltoall_prepare_workspace,
