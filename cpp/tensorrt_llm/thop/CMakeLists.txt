@@ -65,7 +65,6 @@ add_library(
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
   moeOp.cpp
-  moeUtilOp.cpp
   moeCommOp.cpp
   moeLoadBalanceOp.cpp
   fp8BlockScaleMoe.cpp
