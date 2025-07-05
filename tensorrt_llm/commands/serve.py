@@ -16,8 +16,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig)
+                                 DynamicBatchConfig, SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
                                               MetadataServerConfig, ServerRole,
                                               parse_disagg_config_file,
@@ -90,12 +89,32 @@ def get_llm_args(model: str,
         gpus_per_node = device_count()
         if gpus_per_node == 0:
             raise ValueError("No GPU devices found on the node")
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction)
+
+    llm_args = {
+        "model": model,
+        "tokenizer": tokenizer,
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
+        "moe_expert_parallel_size": moe_expert_parallel_size,
+        "gpus_per_node": gpus_per_node,
+        "trust_remote_code": trust_remote_code,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
+        "backend": backend if backend == "pytorch" else None,
+        "num_postprocess_workers": num_postprocess_workers,
+        "postprocess_tokenizer_dir": tokenizer or model,
+        "reasoning_parser": reasoning_parser,
+    }
+
+    # Override in this order: CLI args > YAML configuration > system default
+    if free_gpu_memory_fraction is not None:
+        if "kv_cache_config" not in llm_args_extra_dict:
+            llm_args_extra_dict["kv_cache_config"] = {}
+        llm_args_extra_dict["kv_cache_config"][
+            "free_gpu_memory_fraction"] = free_gpu_memory_fraction
+    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
@@ -105,29 +124,11 @@ def get_llm_args(model: str,
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
+    llm_args_default_dict = {"scheduler_config": scheduler_config}
+    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_default_dict,
+                                               "trtllm-serve default")
 
-    llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_parallel_size": pipeline_parallel_size,
-        "moe_expert_parallel_size": moe_expert_parallel_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
-        "max_batch_size": max_batch_size,
-        "max_num_tokens": max_num_tokens,
-        "max_beam_width": max_beam_width,
-        "max_seq_len": max_seq_len,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend if backend == "pytorch" else None,
-        "num_postprocess_workers": num_postprocess_workers,
-        "postprocess_tokenizer_dir": tokenizer or model,
-        "reasoning_parser": reasoning_parser,
-    }
-
-    return llm_args, llm_args_extra_dict
+    return llm_args
 
 
 def launch_server(host: str,
@@ -265,7 +266,12 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
     """
     logger.set_level(log_level)
 
-    llm_args, _ = get_llm_args(
+    llm_args_extra_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            llm_args_extra_dict = yaml.safe_load(f)
+
+    llm_args = get_llm_args(
         model=model,
         tokenizer=tokenizer,
         backend=backend,
@@ -281,13 +287,8 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
-        reasoning_parser=reasoning_parser)
-
-    llm_args_extra_dict = {}
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_extra_dict = yaml.safe_load(f)
-    llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
+        reasoning_parser=reasoning_parser,
+        **llm_args_extra_dict)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -416,9 +417,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        llm_args = get_llm_args(**server_cfg.other_args)
 
         # Ignore the non-LLM args
         llm_args.pop("router", None)
@@ -442,9 +441,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
             instance_idx)
         server_cfg = disagg_cfg.server_configs[instance_idx]
 
-        llm_args, llm_args_extra_dict = get_llm_args(**server_cfg.other_args)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        llm_args = get_llm_args(**server_cfg.other_args)
 
         _launch_disaggregated_leader(sub_comm, instance_idx, config_file,
                                      log_level)

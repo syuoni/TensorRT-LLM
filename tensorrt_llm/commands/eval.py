@@ -15,6 +15,7 @@
 from typing import Optional
 
 import click
+import yaml
 
 import tensorrt_llm.profiler as profiler
 
@@ -22,8 +23,8 @@ from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
 from ..evaluate import (GSM8K, MMLU, CnnDailymail, GPQADiamond, GPQAExtended,
                         GPQAMain, JsonModeEval)
-from ..llmapi import BuildConfig, KvCacheConfig
-from ..llmapi.llm_utils import update_llm_args_with_extra_options
+from ..llmapi import BuildConfig
+from ..llmapi.llm_utils import update_llm_args_with_extra_dict
 from ..logger import logger, severity_map
 
 
@@ -103,16 +104,6 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
          kv_cache_free_gpu_memory_fraction: float, trust_remote_code: bool,
          extra_llm_api_options: Optional[str]):
     logger.set_level(log_level)
-    build_config = BuildConfig(max_batch_size=max_batch_size,
-                               max_num_tokens=max_num_tokens,
-                               max_beam_width=max_beam_width,
-                               max_seq_len=max_seq_len)
-
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
-
-    if backend == "tensorrt":
-        backend = None
 
     llm_args = {
         "model": model,
@@ -122,14 +113,24 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
         "moe_expert_parallel_size": ep_size,
         "gpus_per_node": gpus_per_node,
         "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
+        "backend": None if backend == "tensorrt" else backend,
     }
 
+    extra_llm_args = {}
     if extra_llm_api_options is not None:
-        llm_args = update_llm_args_with_extra_options(llm_args,
-                                                      extra_llm_api_options)
+        with open(extra_llm_api_options, 'r') as f:
+            extra_llm_args = yaml.safe_load(f)
+
+    if "kv_cache_config" not in extra_llm_args:
+        extra_llm_args["kv_cache_config"] = {}
+    extra_llm_args["kv_cache_config"][
+        "free_gpu_memory_fraction"] = kv_cache_free_gpu_memory_fraction
+    llm_args = update_llm_args_with_extra_dict(llm_args, extra_llm_args,
+                                               extra_llm_api_options)
 
     profiler.start("trtllm init")
     if backend == 'pytorch':

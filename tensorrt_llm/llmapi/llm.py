@@ -117,6 +117,8 @@ class BaseLLM:
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
+        assert kwargs['kv_cache_config']['free_gpu_memory_fraction'] == 0.8
+        breakpoint()
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._llm_id = None
 

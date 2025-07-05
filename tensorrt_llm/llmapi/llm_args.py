@@ -1949,8 +1949,11 @@ class TorchLlmArgs(BaseLlmArgs):
 
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
-        llm_args_dict: Dict,
-        extra_llm_api_options: Optional[str] = None) -> Dict:
+        llm_args_extra_dict: Dict,
+        llm_args_extra_dict_source: Optional[str] = None) -> Dict:
+
+    if llm_args_extra_dict_source is None:
+        llm_args_extra_dict_source = "llm_args_extra_dict"
 
     field_mapping = {
         "quant_config": QuantConfig,
@@ -1962,17 +1965,20 @@ def update_llm_args_with_extra_dict(
         "lora_config": LoraConfig,
     }
     for field_name, field_type in field_mapping.items():
-        if field_name in llm_args_dict:
+        if field_name in llm_args_extra_dict:
+            if field_name in llm_args:
+                logger.warning(
+                    f"{field_name} is already set, ignoring the value from {llm_args_extra_dict_source}."
+                )
+                continue
             if field_name == "speculative_config":
-                llm_args_dict[field_name] = field_type.from_dict(
-                    llm_args_dict[field_name])
+                llm_args_extra_dict[field_name] = field_type.from_dict(
+                    llm_args_extra_dict[field_name])
             else:
-                llm_args_dict[field_name] = field_type(
-                    **llm_args_dict[field_name])
-            extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
-            logger.warning(f"Overriding {field_name} {extra_llm_str}")
+                llm_args_extra_dict[field_name] = field_type(
+                    **llm_args_extra_dict[field_name])
 
-    llm_args = llm_args | llm_args_dict
+    llm_args = llm_args | llm_args_extra_dict
     return llm_args
 
 
