@@ -2163,7 +2163,7 @@ class PyTorchModelEngine(ModelEngine):
                 logits = outputs['logits']
                 assert logits.dim() == 2
                 logits.zero_()
-                logits[:, 1] = 100.0
+                logits[:, 0] = 100.0
 
             # Note: To overlap the CPU and GPU computation as much as possible,
             # guided_decoder.build should be called immediately after the launch of the single step;
