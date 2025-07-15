@@ -2159,6 +2159,12 @@ class PyTorchModelEngine(ModelEngine):
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = maybe_graph.run(inputs)
 
+            if self.iter_counter >= 1024:
+                logits = outputs['logits']
+                assert logits.dim() == 2
+                logits.zero_()
+                logits[:, 1] = 100.0
+
             # Note: To overlap the CPU and GPU computation as much as possible,
             # guided_decoder.build should be called immediately after the launch of the single step;
             # while guided_decoder.execute should be called right before the samplings.
