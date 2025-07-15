@@ -270,14 +270,17 @@ class TorchSampler(Sampler):
         """Handle stop criteria and set appropriate finish reasons and state.
         Returns True if generation should stop."""
         if new_token == request.py_end_id:
+            print(f"finish by end_id: {request.request_id}: {request.get_tokens(self.BEAM)}")
             request.finish_by(FinishReason.END_ID, self.BEAM)
             return True
 
         if self._meet_max_token_stop_criteria(request):
+            print(f"finish by length: {request.request_id}: {request.get_tokens(self.BEAM)}")
             request.finish_by(FinishReason.LENGTH, self.BEAM)
             return True
 
         if self._meet_stop_token_criteria(request):
+            print(f"finish by stop_words: {request.request_id}: {request.get_tokens(self.BEAM)}")
             request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
             return True
 
