@@ -152,7 +152,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
     cutlass_kernels::QuantParams quant_params{};
     cutlass_kernels::MoeMinLatencyParams min_latency_params{};
-
     kernels::LoraParams lora_params{};
 
     auto data_type = input.scalar_type();

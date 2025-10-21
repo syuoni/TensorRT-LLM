@@ -442,6 +442,65 @@ struct MoeMinLatencyParams
     }
 };
 
+__host__ __device__ constexpr int64_t getOffsetWeightSF(int64_t expert_id, int64_t gemm_n, int64_t gemm_k,
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type)
+{
+    auto function = [=](int64_t min_n_dim_alignment, int64_t min_k_dim_alignment, int64_t block_size)
+    {
+        int64_t padded_gemm_n = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(gemm_n, min_n_dim_alignment);
+        int64_t padded_gemm_k = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(gemm_k, min_k_dim_alignment);
+        assert(gemm_k % block_size == 0);
+        return expert_id * padded_gemm_n * padded_gemm_k / block_size;
+    };
+    switch (scaling_type)
+    {
+    case TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX:
+        return function(TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX,
+            TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX,
+            TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize);
+    case TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4:
+        return function(TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4,
+            TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4,
+            TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize);
+    case TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE: return 0; // No scaling factors, no offset
+    }
+
+    assert(false && "Unrecognized scaling type");
+    return 0;
+}
+
+__host__ __device__ constexpr int64_t getOffsetActivationSF(int64_t expert_id, int64_t token_offset, int64_t gemm_k,
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type)
+{
+    auto function = [=](int64_t min_n_dim_alignment, int64_t min_k_dim_alignment, int64_t block_size)
+    {
+        // This formulation ensures that:
+        // `sf_offset[i + 1] - sf_offset[i] >= padded(token_offset[i + 1] - token_offset[i])`
+        // is true for all possible token distributions.
+        int64_t padded_sf_start_offset = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+            token_offset + expert_id * (min_n_dim_alignment - 1), min_n_dim_alignment);
+        int64_t padded_gemm_k = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(gemm_k, min_k_dim_alignment);
+        assert(gemm_k % block_size == 0);
+        assert(padded_gemm_k % block_size == 0);
+        return padded_sf_start_offset * padded_gemm_k / block_size;
+    };
+    switch (scaling_type)
+    {
+    case TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX:
+        return function(TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX,
+            TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX,
+            TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize);
+    case TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4:
+        return function(TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4,
+            TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4,
+            TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize);
+    case TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE: return 0; // No scaling factors, no offset
+    }
+
+    assert(false && "Unrecognized scaling type");
+    return 0;
+}
+
 class CutlassMoeFCRunnerInterface
 {
 public:

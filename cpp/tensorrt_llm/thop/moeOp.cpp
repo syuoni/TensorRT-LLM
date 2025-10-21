@@ -374,39 +374,14 @@ public:
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
-        ActivationType base_activation_type = ActivationType::Swiglu;
-        if (swiglu_alpha.has_value())
-        {
-            CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
-            TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
-                "swiglu_alpha must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
-        }
-        if (swiglu_beta.has_value())
-        {
-            CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
-            TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
-                "swiglu_beta must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
-        }
-        if (swiglu_limit.has_value())
-        {
-            CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
-            TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
-                "swiglu_limit must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
-        }
-        auto activation_params = ActivationParams(base_activation_type,
-            reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
+        auto activation_params = getActivationParams(swiglu_alpha, swiglu_beta, swiglu_limit, num_experts_on_rank);
 
         setRunnerProfiles(profile_ids);
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
+            static_cast<int>(experts_per_token), activation_params.activation_type, parallelism_config, min_latency_mode, stream);
 
         // output is smaller than workspace. Create output after workspace to avoid output_shape occupied a little
         // piece of memory which makes a big partition of memory segment can't be used by workspace.
@@ -449,6 +424,104 @@ public:
 #endif
 
         return output;
+    }
+
+    std::tuple<torch::Tensor, torch::optional<torch::Tensor>> runMoeGemm1(torch::Tensor const& permuted_input,
+        torch::Tensor const& expert_first_token_offset,
+        torch::Tensor const& fc1_expert_weights, torch::optional<torch::Tensor> const& fc1_expert_biases,
+        torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
+        torch::optional<torch::Tensor> const& permuted_input_sf,
+        torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
+        torch::optional<torch::Tensor> const& swiglu_limit,
+        int64_t const num_experts_per_token,
+        int64_t const tp_size, int64_t const tp_rank,
+        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+        torch::optional<int64_t> const profile_id,
+        torch::optional<int64_t> const& unpadded_hidden_size)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        // Free the profile workspace to save memory
+        freeProfileWorkspace();
+
+        int64_t const num_permuted_tokens = permuted_input.size(0);
+        int64_t const num_tokens = num_permuted_tokens / num_experts_per_token;
+        int64_t const num_experts_per_node = fc1_expert_weights.size(0);
+        // int64_t const num_experts = num_experts_per_node * ep_size;
+        int64_t const inter_size = fc1_expert_weights.size(1) / 2;
+        int64_t const hidden_size = fc1_expert_weights.size(2) * mInnerDimMultiplier;
+
+        auto inter_output = torch::empty({num_permuted_tokens, inter_size*2}, torch::dtype(mOutputDtype).device(torch::kCUDA));
+        auto output = torch::empty({num_permuted_tokens, inter_size}, torch::dtype(mOutputDtype).device(torch::kCUDA));
+
+        torch::optional<torch::Tensor> output_sf;
+        if (isNvfp4Quant() || isWFp4AFp8Quant())
+        {
+            TORCH_CHECK(permuted_input_sf.has_value(), "permuted_input_sf must be provided for NVFP4 or WFp4AFp8 quantization");
+            auto scaling_type = isWFp4AFp8Quant()? kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
+                            : kernels::TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+            int64_t const input_sf_size = kernels::getOffsetWeightSF(num_experts_per_node, num_permuted_tokens, hidden_size, scaling_type);
+            int64_t const output_sf_size = kernels::getOffsetActivationSF(num_experts_per_node, num_permuted_tokens, inter_size, scaling_type);
+            TORCH_CHECK(permuted_input_sf->size(0) == input_sf_size, "permuted_input_sf must have the same size as input_sf");
+            auto output_sf = torch::empty({output_sf_size}, permuted_input_sf->options());
+        }
+        auto alpha_scale_ptr_array = torch::empty({num_experts_per_node}, torch::dtype(at::ScalarType::UInt64).device(torch::kCUDA));
+
+        auto const quant_params = getQuantParams(num_experts_per_node, hidden_size, inter_size, quant_scales);
+        auto const* fc1_int_scales = quant_params.wo.fc1_weight_scales;
+        // auto const* fc2_int_scales = quant_params.wo.fc2_weight_scales;
+        auto const* fc1_fp8_dequant = quant_params.fp8.dequant_fc1;
+        auto const* fc2_fp8_quant = quant_params.fp8.quant_fc2;
+        // auto const* fc2_fp8_dequant = quant_params.fp8.dequant_fc2;
+        // auto const* input_fp8_dequant = quant_params.fp8.dequant_input;
+        auto const* fc2_wfp4afp8_quant_scale = quant_params.fp8_mxfp4.fc2.act_global_scale;
+
+        // auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank);
+        auto activation_params = getActivationParams(swiglu_alpha, swiglu_beta, swiglu_limit, num_experts_per_node);
+
+        bool const use_lora = false;
+        auto profile = profile_id.has_value()? mGemm1Profiles[profile_id.value()]: mGemm1Profiles.front();
+
+        // auto [gemm1_tma_ws_input, gemm2_tma_ws_input]
+        //     = setupTmaWarpSpecializedInputs(num_rows, expanded_num_rows, fc1_activation_type, hidden_size,
+        //         unpadded_hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
+        //         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
+        //         min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config, stream);
+        TmaWarpSpecializedGroupedGemmInput gemm1_tma_ws_input;
+        
+        
+        auto stream = at::cuda::getCurrentCUDAStream(permuted_input.get_device());
+
+        mKernelRunner->gemm1(
+            /*input=*/ permuted_input.const_data_ptr(),
+            /*output=*/ output.data_ptr(),
+            /*intermediate_result=*/ inter_output.data_ptr(),
+            /*expert_first_token_offset=*/ expert_first_token_offset.const_data_ptr<int64_t>(),
+            /*tma_ws_input_template=*/ gemm1_tma_ws_input,
+            /*fc1_expert_weights=*/ fc1_expert_weights.const_data_ptr(),
+            /*fc1_expert_biases=*/ fc1_expert_biases.has_value()? fc1_expert_biases->const_data_ptr(): nullptr,
+            /*num_valid_tokens_ptr=*/ expert_first_token_offset.slice(0, num_experts_per_node).const_data_ptr<int64_t>(),
+            /*fc1_int_scales=*/ fc1_int_scales,
+            /*fc1_fp8_dequant=*/ fc1_fp8_dequant,
+            /*fc2_fp8_quant=*/ isWFp4AFp8Quant() ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant,
+            /*fc1_fp4_act_flat=*/ permuted_input_sf.has_value()? permuted_input_sf->const_data_ptr<TmaWarpSpecializedGroupedGemmInput::ElementSF>(): nullptr,
+            /*fc2_fp4_act_flat=*/ output_sf.has_value()? output_sf->data_ptr<TmaWarpSpecializedGroupedGemmInput::ElementSF>(): nullptr,
+            /*quant_params=*/ quant_params,
+            /*num_rows=*/ num_tokens,
+            /*expanded_num_rows=*/ num_permuted_tokens,
+            /*hidden_size=*/ hidden_size,
+            /*inter_size=*/ inter_size,
+            /*num_experts_per_node=*/ num_experts_per_node,
+            /*fc1_activation_type=*/ activation_params,
+            /*alpha_scale_ptr_array=*/ reinterpret_cast<const float**>(alpha_scale_ptr_array.data_ptr()),
+            /*bias_is_broadcast=*/ !use_lora,
+            /*use_deepseek_fp8_block_scale=*/ mUseDeepSeekFP8BlockScaling,
+            /*stream=*/ stream,
+            /*config=*/ profile,
+            /*min_latency_mode=*/ false,
+            /*num_active_experts_per*/ nullptr,
+            /*active_expert_global_ids=*/ nullptr
+        );
+        return std::make_tuple(output, output_sf);
     }
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> runMoeMinLantency(torch::Tensor const& input,
@@ -527,33 +600,7 @@ public:
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config
             = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank);
-        ActivationType base_activation_type = ActivationType::Swiglu;
-        if (swiglu_alpha.has_value())
-        {
-            CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
-            TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
-                "swiglu_alpha must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
-        }
-        if (swiglu_beta.has_value())
-        {
-            CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
-            TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
-                "swiglu_beta must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
-        }
-        if (swiglu_limit.has_value())
-        {
-            CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
-            TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
-                "swiglu_limit must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
-        }
-        auto activation_params = ActivationParams(base_activation_type,
-            reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
-
+        auto activation_params = getActivationParams(swiglu_alpha, swiglu_beta, swiglu_limit, num_experts_on_rank);
         setRunnerProfiles(profile_ids);
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -572,7 +619,7 @@ public:
         min_latency_params.active_expert_global_ids = static_cast<int*>(active_expert_global_ids.data_ptr());
 
         WorkspaceInfo const& workspace_info = getWorkspaceInfo(num_rows, hidden_size, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), base_activation_type, parallelism_config, min_latency_mode, stream);
+            static_cast<int>(experts_per_token), activation_params.activation_type, parallelism_config, min_latency_mode, stream);
 
         auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
 
@@ -813,6 +860,37 @@ private:
             = common::nextWorkspacePtr(static_cast<int8_t*>(workspace_info.workspace.data_ptr()), moe_workspace_size);
 
         return workspace_info;
+    }
+
+    ActivationParams getActivationParams(torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
+        torch::optional<torch::Tensor> const& swiglu_limit, int64_t const num_experts_per_node) const
+    {
+        ActivationType base_activation_type = ActivationType::Swiglu;
+        if (swiglu_alpha.has_value())
+        {
+            CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
+            TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_per_node,
+                "swiglu_alpha must have num_experts_per_node elements.");
+            base_activation_type = ActivationType::SwigluBias;
+        }
+        if (swiglu_beta.has_value())
+        {
+            CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
+            TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_per_node,
+                "swiglu_beta must have num_experts_per_node elements.");
+            base_activation_type = ActivationType::SwigluBias;
+        }
+        if (swiglu_limit.has_value())
+        {
+            CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
+            TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_per_node,
+                "swiglu_limit must have num_experts_per_node elements.");
+            base_activation_type = ActivationType::SwigluBias;
+        }
+        return {base_activation_type,
+            reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
+            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
+            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr)};
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
@@ -1142,6 +1220,11 @@ private:
         return mActivationDtype == c10::ScalarType::Float8_e4m3fn && mWeightDtype == c10::ScalarType::Long
             && mUseMxfp8ActScaling;
     }
+
+    bool isWFp4AFp8Quant() const
+    {
+        return mActivationDtype == c10::ScalarType::Float8_e4m3fn && mWeightDtype == c10::ScalarType::Long;
+    }
 };
 
 } // namespace torch_ext
@@ -1153,5 +1236,6 @@ TORCH_LIBRARY(trtllm, m)
         .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
         .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
+        .def("run_moe_gemm1", &torch_ext::FusedMoeRunner::runMoeGemm1)
         .def("run_moe_min_latency", &torch_ext::FusedMoeRunner::runMoeMinLantency);
 }
