@@ -897,6 +897,153 @@ void threeStepBuildExpertMapsSortFirstToken(int const* token_selected_experts, i
         num_experts_per_node, num_tokens_per_block, num_blocks_per_seq, stream);
 }
 
+
+__global__ void decoupledLookbackMoeSortInitKernel(cub::ScanTileState<int> tile_state, int num_tiles)
+{
+    tile_state.InitializeStatus(num_tiles);
+}
+
+
+template <int kNumTokensPerBlock>
+__global__ void decoupledLookbackMoeSortKernel(int const* token_selected_experts, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row, int64_t* expert_first_token_offset,
+    cub::ScanTileState<int> tile_state,
+    int64_t const num_tokens, int64_t const num_experts_per_token, int const start_expert_id)
+{
+    using BlockScan = cub::BlockScan<int, kNumTokensPerBlock>;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+
+    using scan_op_t         = ::cuda::std::plus<>;
+    using scan_tile_state_t = cub::ScanTileState<int>;
+    using tile_prefix_op_t  = cub::TilePrefixCallbackOp<int, scan_op_t, scan_tile_state_t>;
+    using temp_storage_t    = typename tile_prefix_op_t::TempStorage;
+    __shared__ int blockCount[2];
+    __shared__ temp_storage_t temp_storage_2;
+
+    // target_expert_id and expert_id are offset by start_expert_id
+    int const target_expert_id = blockIdx.y;
+    int const block_id = blockIdx.x;
+    int const num_blocks_per_seq = gridDim.y;
+    int const num_experts_per_node = gridDim.x;
+    int const token_id = block_id * kNumTokensPerBlock + threadIdx.x;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
+    int expanded_token_id = -1;
+    if (token_id < num_tokens)
+    {
+        for (int i = 0; i < num_experts_per_token; i++)
+        {
+            // TODO(enweiz): Fix uncoalesced access with shared memory.
+            int const expert_id = token_selected_experts[token_id * num_experts_per_token + i] - start_expert_id;
+            if (expert_id == target_expert_id)
+            {
+                expanded_token_id = i * num_tokens + token_id;
+                break;
+            }
+        }
+    }
+
+    int const has_matched = expanded_token_id >= 0 ? 1 : 0;
+    int index;
+    BlockScan(temp_storage).ExclusiveSum(has_matched, index);
+    if (threadIdx.x == kNumTokensPerBlock - 1)
+    {
+        blockCount[0] = index + has_matched;
+    }
+    __syncthreads();
+
+
+    int const tile_id = target_expert_id * num_blocks_per_seq + block_id;
+    scan_op_t scan_op{};
+    tile_prefix_op_t prefix(tile_state, temp_storage_2, scan_op, tile_id);
+
+    if (tile_id == 0)
+    {
+        // The first tile
+        if (threadIdx.x == 0)
+        {
+            tile_state.SetInclusive(tile_id, blockCount[0]);
+            blockCount[1] = 0;
+        }
+    }
+    else
+    {
+        // The other tiles
+        int const warp_id = threadIdx.x / warpSize;
+        if (warp_id == 0)
+        {
+            int const tile_offset = prefix(blockCount[0]);
+            if (threadIdx.x == 0)
+            {
+                blockCount[1] = tile_offset;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (has_matched)
+    {
+        int const permuted_row = blockCount[1] + index;
+        int const unpermuted_row = target_expert_id * num_tokens + token_id;
+        permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
+        permuted_token_selected_experts[permuted_row] = target_expert_id;
+        unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
+    }
+    if (threadIdx.x == kNumTokensPerBlock - 1)
+    {
+        if (block_id == 0)
+        {
+            expert_first_token_offset[target_expert_id] = blockCount[1];
+        }
+        if (target_expert_id == num_experts_per_node - 1 && block_id == num_blocks_per_seq - 1)
+        {
+            expert_first_token_offset[num_experts_per_node] = blockCount[1] + index + has_matched;
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+
+void decoupledLookbackMoeSort(int const* token_selected_experts, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row, int64_t* expert_first_token_offset,
+    uint8_t* sort_temp_storage,
+    int64_t const num_tokens, int64_t const num_experts_per_node, int64_t const num_experts_per_token,
+    int const start_expert_id, cudaStream_t stream)
+{
+    int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
+    int64_t const num_blocks_per_seq = tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
+
+    int const num_tiles = num_blocks_per_seq * num_experts_per_node;
+    using scan_tile_state_t = cub::ScanTileState<int>;
+    size_t temp_storage_bytes{};
+    scan_tile_state_t::AllocationSize(num_tiles, temp_storage_bytes);
+
+    scan_tile_state_t tile_state;
+    tile_state.Init(num_tiles, sort_temp_storage, temp_storage_bytes);
+
+    // printf("Before decoupledLookbackMoeSortInitKernel\n");
+    decoupledLookbackMoeSortInitKernel<<<tensorrt_llm::common::ceilDiv(num_tiles, 256), 256, 0, stream>>>(tile_state, num_tiles);
+    sync_check_cuda_error(stream);
+    // printf("After decoupledLookbackMoeSortInitKernel\n");
+
+    dim3 const blocks( num_blocks_per_seq, num_experts_per_node);
+    dim3 const threads(num_tokens_per_block);
+    decoupledLookbackMoeSortKernel<256><<<blocks, threads, 0, stream>>>(token_selected_experts, permuted_token_selected_experts, permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, expert_first_token_offset,
+        tile_state, num_tokens, num_experts_per_token, start_expert_id);
+    // printf("After decoupledLookbackMoeSortKernel\n");
+
+    // printMatrix(expert_first_token_offset, 1, num_experts_per_node+1, num_experts_per_node+1);
+    // printMatrix(permuted_token_selected_experts, 8, 8, 8);
+}
+
+
+
 // ============================== Infer GEMM sizes =================================
 
 template <class T>
@@ -2580,6 +2727,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     size_t const blocked_row_to_unpermuted_row_size
         = min_latency_mode ? 0 : num_experts_per_node * num_rows * sizeof(int);
 
+    using scan_tile_state_t = cub::ScanTileState<int>;
+    size_t sort_temp_storage_size{};
+    scan_tile_state_t::AllocationSize(num_experts_per_node * num_blocks_per_seq, sort_temp_storage_size);
+
     size_t const permuted_data_size = permuted_elems * dtype_size;
     size_t const expert_first_token_offset_size = (num_experts_per_node + 1) * sizeof(int64_t);
     size_t const permuted_token_final_scales_size = mayHaveFinalizeFused() ? num_moe_inputs * sizeof(float) : 0;
@@ -2678,6 +2829,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     ADD(blocked_expert_counts);
     ADD(blocked_expert_counts_cumsum);
     ADD(blocked_row_to_unpermuted_row);
+    ADD(sort_temp_storage);
     ADD(expert_first_token_offset);
     ADD(permuted_token_final_scales);
     ADD(overlapped_gemm1_gemm2_inputs);
@@ -2738,6 +2890,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     blocked_expert_counts_ = getWsPtr(int{}, "blocked_expert_counts");
     blocked_expert_counts_cumsum_ = getWsPtr(int{}, "blocked_expert_counts_cumsum");
     blocked_row_to_unpermuted_row_ = getWsPtr(int{}, "blocked_row_to_unpermuted_row");
+    sort_temp_storage_ = getWsPtr(uint8_t{}, "sort_temp_storage");
 
     expert_first_token_offset_ = getWsPtr(int64_t{}, "expert_first_token_offset");
 
@@ -3653,10 +3806,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         if (!fused_prologue_result)
         {
             TLLM_LOG_TRACE("Falling back to unfused prologue");
-            threeStepBuildExpertMapsSortFirstToken(token_selected_experts, permuted_token_selected_experts_,
-                permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row, expert_first_token_offset_,
-                blocked_expert_counts_, blocked_expert_counts_cumsum_, blocked_row_to_unpermuted_row_, num_rows,
+            decoupledLookbackMoeSort(token_selected_experts, permuted_token_selected_experts_,
+                permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row, expert_first_token_offset_, 
+                sort_temp_storage_, num_rows,
                 num_experts_per_node, experts_per_token, start_expert, stream);
+            
         }
 
         sync_check_cuda_error(stream);
@@ -4259,6 +4413,10 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     size_t const blocked_expert_counts_cumsum_size = blocked_expert_counts_size;
     size_t const blocked_row_to_unpermuted_row_size = mMinLatencyMode ? 0 : num_experts_per_node * maxM * sizeof(int);
 
+    using scan_tile_state_t = cub::ScanTileState<int>;
+    size_t sort_temp_storage_size{};
+    scan_tile_state_t::AllocationSize(num_experts_per_node * num_blocks_per_seq, sort_temp_storage_size);
+
     // The follow buffers are used in min_latency_mode
     size_t num_active_experts_per_node_size
         = mMinLatencyMode ? sizeof(int) * NUM_ROUTING_SAMPLES : 0; // smaller than or equal to num_experts_per_node
@@ -4289,6 +4447,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     ADD(blocked_expert_counts);
     ADD(blocked_expert_counts_cumsum);
     ADD(blocked_row_to_unpermuted_row);
+    ADD(sort_temp_storage);
     ADD(token_topk_unpermuted_scales);
     ADD(num_active_experts_per_node);
     ADD(active_expert_global_ids);

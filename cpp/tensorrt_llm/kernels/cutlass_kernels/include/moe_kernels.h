@@ -873,6 +873,7 @@ private:
     int* blocked_expert_counts_{};
     int* blocked_expert_counts_cumsum_{};
     int* blocked_row_to_unpermuted_row_{};
+    uint8_t* sort_temp_storage_{};
     T* permuted_data_{};
     float* permuted_token_final_scales_{};
 
