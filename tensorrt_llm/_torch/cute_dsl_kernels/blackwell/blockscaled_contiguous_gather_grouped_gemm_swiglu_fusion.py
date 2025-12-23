@@ -171,8 +171,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     - Token ID mapping enables efficient gather operation during A/SFA load
     - SwiGLU activation fusion in epilogue (up * silu(gate) with interleaved weights)
     - Optional quantization fusion for Float4E2M1FN output with scale factor generation
-    - Warp specialization: Scheduler (warp 10), LDGSTS A/SFA (warps 4-7), TMA B/SFB (warp 9),
-      MMA (warp 8), Epilogue (warps 0-3)
+    - Warp specialization: Scheduler (warp 10), A Sync Transform (warp 11, only used when
+      use_2cta_instrs is True), LDGSTS A/SFA (warps 4-7), TMA B/SFB (warp 9), MMA (warp 8),
+      Epilogue (warps 0-3)
 
     :param sf_vec_size: Scalefactor vector size (16 for NVF4, 32 for MXF4/MXF8).
     :type sf_vec_size: int
@@ -283,7 +284,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         self.sf_vec_size = sf_vec_size
         self.topk = topk
-        self.acc_dtype: Type[cutlass.Numeric] = cutlass.Float32
+        self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
@@ -353,9 +354,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
+
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+
         self.vectorized_f32 = vectorized_f32
 
     def _setup_attributes(self):
@@ -425,6 +428,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             mma_inst_shape_k * mma_inst_tile_k,
         )
 
+        self.mma_tiler_c = (
+            self.mma_inst_shape_mn[0],
+            self.mma_inst_shape_mn[1] // 2,
+            mma_inst_shape_k * mma_inst_tile_k,
+        )
+
         self.cta_tile_shape_mnk = (
             self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
             self.mma_tiler[1],
@@ -441,12 +450,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.mma_tiler_sfb[0] // cute.size(tiled_mma.thr_id.shape),
             self.mma_tiler_sfb[1],
             self.mma_tiler_sfb[2],
-        )
-
-        self.mma_tiler_c = (
-            self.mma_inst_shape_mn[0],
-            self.mma_inst_shape_mn[1] // 2,
-            mma_inst_shape_k * mma_inst_tile_k,
         )
 
         self.cta_tile_shape_mnk_c = (
@@ -587,6 +590,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         5. Launch the kernel synchronously with warp specialization:
            - Scheduler warp: Dispatches tile information
            - LDGSTS warps: Load A and SFA with gather
+           - A Sync Transform warps: Transform the sync signal of A and SFA from global to
+             shared memory when use_2cta_instrs is True
            - TMA warp: Load B and SFB with multicast
            - MMA warp: Perform matrix multiply-accumulate
            - Epilogue warps: Apply SwiGLU activation, optional quantization, and store results
@@ -642,10 +647,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
 
+        # Setup sfb tensor by filling B tensor to scale factor atom layout
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
         sfb = cute.make_tensor(sfb.iterator, sfb_layout)
 
+        # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
         if cutlass.const_expr(self.generate_sfc):
             sfc_layout = blockscaled_utils.tile_atom_to_shape_SF(c.shape, self.sf_vec_size)
@@ -957,9 +964,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Prefetch tma desc
         #
         if warp_idx == self.tma_b_warp_id:
-            # cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
-            # cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
             cpasync.prefetch_descriptor(tma_atom_c)
 
@@ -1004,6 +1009,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
+
+        # Pipeline Init: Initialize A SYNC Transform pipeline when use_2cta_instrs is True
+        # Producer: 1 warp (warp 11) for LDGSTS SYNC transformation operations
+        # Consumer: MMA warp for consuming A/SFA data
         if cutlass.const_expr(self.use_2cta_instrs):
             a_sync_transform_pipeline_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
@@ -1050,7 +1059,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Pipeline Init: Tensor memory dealloc barrier init
+        # Pipeline Init:Initialize tile info pipeline (barrier) and states
         tile_info_pipeline_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.threads_per_warp * 1,
@@ -1229,7 +1238,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         griddepcontrol_wait()
 
         #
-        # Specialized Schedule warp
+        # Specialized Schedule Warp
         #
         if warp_idx == self.sched_warp_id:
             #
@@ -1296,7 +1305,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # with gather/permutation capability enabled by token_id_mapping
         #
         if warp_idx <= self.ldgsts_a_warp_id[-1] and warp_idx >= self.ldgsts_a_warp_id[0]:
-            # cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Setup LDGSTS copy atoms for A and SFA
             # A: 8x LDGSTS.128 per thread with swizzle_128B for A matrix (32 elements per thread)
@@ -1542,6 +1550,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             #
             a_pipeline.producer_tail(a_producer_state)
 
+        #
+        # Specialized A/SFA Sync Transform Warp (warp 11) when use_2cta_instrs is True
+        # This warp serve as sync transformation for A and SFA
+        #
         if warp_idx == self.sync_transform_warp_id:
             if cutlass.const_expr(self.use_2cta_instrs):
                 #
@@ -1611,9 +1623,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     tile_info_consumer_state.advance()
 
                 #
-                # Wait A/B buffer empty
+                # Wait A sync transform buffer empty
                 #
                 a_sync_transform_pipeline.producer_tail(a_sync_transform_producer_state)
+
         #
         # Specialized TMA B/SFB load warp (warp 9)
         # This warp uses TMA instructions to load B and SFB from global to shared memory
@@ -1661,9 +1674,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 #
                 # ((atom_v, rest_v), loopK)
                 tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
-
-                # ((atom_v, rest_v), RestK)
-                # tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None, 0)]
 
                 # Apply SFB slicing hack when cta_tile_shape_n=64
                 slice_n = mma_tile_coord_mnl[1]
@@ -1870,7 +1880,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                 # Apply TMEM pointer offset hack when cta_tile_shape_n=192 or
                 # cta_tile_shape_n=64
-
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
                     # If this is an ODD tile, shift the TMEM start address for
@@ -2958,21 +2967,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
         is_valid = True
 
-        use_2cta_instrs = mma_tiler_mn[0] == 256
         # Skip invalid mma tile shape
-        if not (
-            (not use_2cta_instrs and mma_tiler_mn[0] in [64, 128])
-            or (use_2cta_instrs and mma_tiler_mn[0] in [128, 256])
-        ):
+        if mma_tiler_mn[0] not in (128, 256):
             is_valid = False
         # Skip invalid mma tile n
-        # Needs to have even iterations with Epi Tile N 64 for swiGeLU fusion
+        # SwiGlu Fusion requires even epi_tile counts,
+        # based on epi_tile_n = 64, only mma_tiler_n = 128 and 256 are supported
         if mma_tiler_mn[1] not in (128, 256):
             is_valid = False
+
         # Skip illegal cluster shape
-        if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) != 0:
+        if (mma_tiler_mn[0] // cluster_shape_mn[0]) != 128:
             is_valid = False
-        # Skip invalid cluster shape
+
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
@@ -2985,13 +2992,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             or not is_power_of_2(cluster_shape_mn[1])
         ):
             is_valid = False
-        cluster_tiler_m = (cluster_shape_mn[0] // (2 if use_2cta_instrs else 1)) * mma_tiler_mn[0]
 
-        # Skip invalid cluster tiler shape since contiguous layout can't handle oob access
-        # The contiguous layout means the aligned data is stored in a contiguous manner.
-        # It can't handle runtime oob when alignment is not align with the tile_M,
-        # since the problem shape of TMA store can't be changed at runtime.
-        if cluster_tiler_m not in [128, 256]:
+        # We only support cluster shape n = 1 for now
+        # TODO: Support cluster shape n > 1
+        if cluster_shape_mn[1] != 1:
             is_valid = False
 
         return is_valid
